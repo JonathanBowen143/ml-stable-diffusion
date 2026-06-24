@@ -8,6 +8,20 @@ Use the project script for the Codex app and terminal smoke checks:
 ./script/build_and_run.sh --verify
 ```
 
+Install the stable iMac command:
+
+```bash
+./script/install_command.sh
+```
+
+After installation, `sdctl` is available from any folder through `~/.local/bin`:
+
+```bash
+sdctl status
+sdctl models
+sdctl smoke
+```
+
 The default verification runs the `smoke` preset. It uses the local Stable Diffusion v1.4 compiled resources, `cpuAndGPU`, 2 diffusion steps, seed `42`, one image, and writes output to a timestamped folder under:
 
 ```text

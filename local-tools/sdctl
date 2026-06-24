@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" == /* ]] || SOURCE="$SOURCE_DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+cd "$ROOT"
+
+PYTHON="$ROOT/.venv/bin/python"
+SWIFT_CLI="$ROOT/.build/debug/StableDiffusionSample"
+
+MODEL_V14="$ROOT/models/coreml-stable-diffusion-v1-4_original_compiled/original/compiled"
+MODEL_SDXL="$ROOT/models/current-sdxl"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  sdctl status
+  sdctl build
+  sdctl models
+  sdctl smoke [--model v14|sdxl]
+  sdctl generate [--model v14|sdxl] [--steps N] "prompt text"
+
+Notes:
+  - v14 is the small verified smoke-test model.
+  - sdxl points to Apple's mixed-bit palettized SDXL Core ML model.
+  - Stable Diffusion generates/transforms images. It does not read images as OCR or visual QA.
+  - When the command is not installed, run it from the repo as local-tools/sdctl.
+USAGE
+}
+
+model_path() {
+  case "${1:-}" in
+    v14) printf '%s\n' "$MODEL_V14" ;;
+    sdxl) printf '%s\n' "$MODEL_SDXL" ;;
+    *) printf 'Unknown model: %s\n' "${1:-}" >&2; return 2 ;;
+  esac
+}
+
+model_flags() {
+  case "${1:-}" in
+    v14) ;;
+    sdxl) printf '%s\n' "--xl --reduce-memory" ;;
+    *) printf 'Unknown model: %s\n' "${1:-}" >&2; return 2 ;;
+  esac
+}
+
+require_swift_cli() {
+  if [[ ! -x "$SWIFT_CLI" ]]; then
+    printf 'Missing Swift CLI. Run: sdctl build\n' >&2
+    return 1
+  fi
+}
+
+check_model() {
+  local name="$1"
+  local path
+  path="$(model_path "$name")"
+  if [[ ! -d "$path" ]]; then
+    printf '[missing] %s: %s\n' "$name" "$path"
+    return 1
+  fi
+  local required=(Unet.mlmodelc VAEDecoder.mlmodelc vocab.json merges.txt)
+  if [[ "$name" == "sdxl" ]]; then
+    required+=(TextEncoder.mlmodelc TextEncoder2.mlmodelc)
+  else
+    required+=(TextEncoder.mlmodelc)
+  fi
+  local missing=0
+  for item in "${required[@]}"; do
+    if [[ ! -e "$path/$item" ]]; then
+      printf '[missing] %s: %s/%s\n' "$name" "$path" "$item"
+      missing=1
+    fi
+  done
+  if [[ "$missing" -eq 0 ]]; then
+    printf '[ok] %s: %s\n' "$name" "$path"
+  fi
+}
+
+status() {
+  printf 'Workspace: %s\n' "$ROOT"
+  printf 'Git remote: %s\n' "$(git remote get-url origin 2>/dev/null || printf 'none')"
+  printf 'Git head: %s\n' "$(git rev-parse --short HEAD 2>/dev/null || printf 'none')"
+  printf 'Git upstream: %s\n' "$(git rev-parse --short origin/main 2>/dev/null || printf 'none')"
+  git status --short --branch
+  printf '\n'
+
+  if [[ -x "$PYTHON" ]]; then
+    "$PYTHON" - <<'PY'
+import torch
+import coremltools as ct
+import python_coreml_stable_diffusion as pcsd
+print(f"Python package: python_coreml_stable_diffusion {pcsd.__version__}")
+print(f"Core ML Tools: {ct.__version__}")
+print(f"Torch: {torch.__version__}; MPS available: {torch.backends.mps.is_available()}")
+PY
+  else
+    printf '[missing] Python venv: %s\n' "$PYTHON"
+  fi
+
+  if [[ -x "$SWIFT_CLI" ]]; then
+    printf '[ok] Swift CLI: %s\n' "$SWIFT_CLI"
+  else
+    printf '[missing] Swift CLI: %s\n' "$SWIFT_CLI"
+  fi
+
+  check_model v14 || true
+  check_model sdxl || true
+  printf '\n'
+  du -sh models outputs .venv .build 2>/dev/null || true
+  df -h .
+}
+
+build() {
+  swift build
+}
+
+models() {
+  check_model v14 || true
+  check_model sdxl || true
+  printf '\nCurrent SDXL pointer:\n'
+  ls -l "$ROOT/models/current-sdxl" 2>/dev/null || true
+}
+
+run_image() {
+  local mode="$1"
+  shift
+  local model="v14"
+  local steps
+  if [[ "$mode" == "smoke" ]]; then
+    steps=4
+  else
+    steps=30
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model)
+        model="${2:-}"
+        shift 2
+        ;;
+      --steps)
+        steps="${2:-}"
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        return 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        printf 'Unknown option: %s\n' "$1" >&2
+        return 2
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  local prompt="${*:-}"
+  if [[ -z "$prompt" ]]; then
+    if [[ "$mode" == "smoke" ]]; then
+      prompt="a simple product photo of a clean desk on an iMac"
+    else
+      printf 'Missing prompt.\n' >&2
+      return 2
+    fi
+  fi
+
+  require_swift_cli
+  local resource_path
+  resource_path="$(model_path "$model")"
+  if [[ ! -d "$resource_path" ]]; then
+    printf 'Missing model path: %s\n' "$resource_path" >&2
+    return 1
+  fi
+
+  mkdir -p "$ROOT/outputs/$mode-$model"
+  local extra_flags
+  extra_flags="$(model_flags "$model")"
+
+  # shellcheck disable=SC2086
+  "$SWIFT_CLI" "$prompt" \
+    --resource-path "$resource_path" \
+    --seed 93 \
+    --step-count "$steps" \
+    --output-path "$ROOT/outputs/$mode-$model" \
+    --compute-units all \
+    $extra_flags
+}
+
+main() {
+  local cmd="${1:-}"
+  if [[ $# -gt 0 ]]; then
+    shift
+  fi
+
+  case "$cmd" in
+    status) status "$@" ;;
+    build) build "$@" ;;
+    models) models "$@" ;;
+    smoke) run_image smoke "$@" ;;
+    generate) run_image generate "$@" ;;
+    --help|-h|"") usage ;;
+    *)
+      printf 'Unknown command: %s\n' "$cmd" >&2
+      usage >&2
+      return 2
+      ;;
+  esac
+}
+
+main "$@"
